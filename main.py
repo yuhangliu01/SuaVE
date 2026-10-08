@@ -87,7 +87,7 @@ class WarmupKLLoss:
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('-f', '--file', default='/data/Yuhang/dagVAE-master/data/tcl_1000_40_5_5_3_1_gauss_lrelu_u_dg2.npz', help='path to data file in .npz format. (default None)')
+    parser.add_argument('-f', '--file', default=None, help='path to data file in .npz format. (default None)')
     parser.add_argument('-x', '--data-args', type=str, default=None,
                         help='argument string to generate a dataset. '
                              'This should be of the form nps_ns_dl_dd_nl_s_p_a_u_n. '
@@ -102,11 +102,11 @@ if __name__ == '__main__':
     parser.add_argument('-d', '--depth', type=int, default=4, help='depth (n_layers) of the networks (default 3)')
     parser.add_argument('-l', '--lr', type=float, default=5e-3, help='learning rate (default 1e-3)')
     parser.add_argument('-s', '--seed', type=int, default=1, help='random seed (default 1)')
-    parser.add_argument('-c', '--cuda', action='store_true', default=True, help='train on gpu')
-    parser.add_argument('-p', '--preload-gpu', action='store_true', default=True, dest='preload',
+    parser.add_argument('-c', '--cuda', action='store_true', default=False, help='train on gpu (CPU by default)')
+    parser.add_argument('-p', '--preload-gpu', action='store_true', default=False, dest='preload',
                         help='preload data on gpu for faster training.')
     parser.add_argument('-a', '--anneal', action='store_true', default=False, help='use annealing in learning')
-    parser.add_argument('-n', '--no-log', action='store_true', default=True, help='run without logging')
+    parser.add_argument('-n', '--no-log', action='store_true', default=False, help='skip checkpoints and persistent metric logs')
     parser.add_argument('-q', '--log-freq', type=int, default=25, help='logging frequency (default 25).')
 
     parser.add_argument('-et', '--edge-threshold', type=float, default=0.1, help='threshold to cut edge.')
@@ -123,13 +123,22 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
 
+    if args.preload and not args.cuda:
+        parser.error('--preload-gpu requires --cuda')
+    if args.cuda and not torch.cuda.is_available():
+        parser.error('--cuda requested but CUDA is unavailable')
+    for name in ('batch_size', 'epochs', 'log_freq'):
+        if getattr(args, name) <= 0:
+            parser.error(name + ' must be positive')
+    if args.max_iter is not None and args.max_iter <= 0:
+        parser.error('--max-iter must be positive')
     print(args)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
     st = time.time()
 
-    if args.file is None:
+    if args.data_args is not None or args.file is None:
         args.file = create_if_not_exist_dataset(root='data/', arg_str=args.data_args)
     metadata = vars(args).copy()
     del metadata['no_log'], metadata['data_args']
@@ -164,7 +173,7 @@ if __name__ == '__main__':
     print('setup time: {}s'.format(ste - st))
 
     # setup loggers
-    logger = Logger(path=LOG_FOLDER)
+    logger = Logger(logdir=LOG_FOLDER)
     exp_id = logger.get_id()
     tensorboard_run_name = TENSORBOARD_RUN_FOLDER + 'exp' + str(exp_id) + '_'.join(
         map(str, ['', args.batch_size, args.max_iter, args.lr, args.hidden_dim, args.depth, args.anneal]))
@@ -203,6 +212,8 @@ if __name__ == '__main__':
             elbo = elbo - 0.*torch.norm(weight_sample,1)
 
             #elbo = (recon + klloss).mean() - 0.*torch.norm(weight_sample,1)
+            if not torch.isfinite(elbo):
+                raise RuntimeError('Non-finite ELBO at iteration {}'.format(it))
             elbo.mul(-1).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
 
@@ -215,27 +226,26 @@ if __name__ == '__main__':
                 writer.add_scalar('data/elbo', logger.get_last('elbo'), it)
                 #scheduler.step() #logger.get_last('elbo')
 
-            if it % int(args.max_iter / 5) == 0 and not args.no_log:
+            if it % max(1, args.max_iter // 5) == 0 and not args.no_log:
                 checkpoint(TORCH_CHECKPOINT_FOLDER, exp_id, it, model, optimizer,
-                           logger.get_last('elbo'))
+                           logger.get_last('elbo'), perf=None)
             
             it += 1
+            if it >= args.max_iter:
+                break
 
 
         #eveluate:
         #data = np.load(path)
         model.eval()
-        alldata_u = train_loader.u
-        alldata_x = train_loader.x
-        alldata_s = train_loader.s
-        alldata_nb = train_loader.nb
-        
         Allsz = np.empty((200,latent_dim))
         Allsn = np.empty((200,latent_dim))
         Allez = np.empty((200,latent_dim))
         Allen = np.empty((200,latent_dim))
         for _, (x, u, z, sn) in enumerate(train_loader):
-            elbo, z_est, noise_est, weight_sample, weights_u0 = model.elbo(x, u)
+            x, u = x.to(device), u.to(device)
+            with torch.no_grad():
+                elbo, z_est, noise_est, weight_sample, weights_u0 = model.elbo(x, u)
            
             Allsz = np.append(Allsz, z.cpu().detach().numpy(), axis=0)
             Allsn = np.append(Allsn, sn.cpu().detach().numpy(), axis=0)
@@ -253,7 +263,7 @@ if __name__ == '__main__':
         #elbo, z_est, noise_est, weight_sample, _ = model.elbo(alldata_x, alldata_u)
 
         weights_all = model.WeightMat()
-        perf, assign_z = mcc(truez, estn, permute=True)
+        perf, assign_z = mcc(truez, estz, permute=True)
         perfn, assign_n = mcc(truen, estn, permute=True)
 
 
@@ -264,7 +274,8 @@ if __name__ == '__main__':
         logger.update('perfn', perfn)
 
         logger.log()
-        writer.add_scalar('data/perf_z_n',logger.get_last('perfz'), logger.get_last('perfn'), it)
+        writer.add_scalar('data/perf_z_n',logger.get_last('perfz'), it)
+        writer.add_scalar('data/perf_n', logger.get_last('perfn'), it)
 
         eet = time.time()
         print('epoch {} done in: {:.3f}s, loss: {:.3f}, \t Latent_z: {:.3f}, Latent_n: {:.3f}'.format(int(it / len(train_loader)) + 1, eet - est,
@@ -276,6 +287,7 @@ if __name__ == '__main__':
        
 
     et = time.time()
+    print('completed optimizer steps: {}'.format(it))
     print('training time: {}s'.format(et - ste))
 
     writer.close()

@@ -470,17 +470,12 @@ class SyntheticDataset(Dataset):
     def __init__(self, path, device='cpu'):
         self.device = device
         self.path = path
-        try:
-            data = np.load(path)
-        except:
-            # error occured because many scripts were attempting to create it at same time.
-            # one solution would be to wait and retry, the other would be to make sure
-            # datasets are all created already.
-            pass
+        data = np.load(path)
         self.data = data
         self.s = torch.from_numpy(data['s']).to(self.device)
         self.x = torch.from_numpy(data['x']).to(self.device)
         self.u = torch.from_numpy(data['u']).to(self.device)
+        self.nb = torch.from_numpy(data['n']).to(self.device)
         self.L = data['L']
         self.M = data['m']
         self.len = self.x.shape[0]
@@ -497,7 +492,7 @@ class SyntheticDataset(Dataset):
         return self.len
 
     def __getitem__(self, index):
-        return self.x[index], self.u[index], self.s[index]
+        return self.x[index], self.u[index], self.s[index], self.nb[index]
 
     def get_metadata(self):
         return {'path': self.path,
@@ -567,7 +562,7 @@ class DataLoaderGPU:
                 }
 
 
-def create_if_not_exist_dataset(root='data/', nps=1000, ns=40, dl=2, dd=4, nl=3, s=1, p='gauss', a='xtanh',
+def create_if_not_exist_dataset(root='data/', nps=1000, ns=40, dl=5, dd=5, nl=3, s=1, p='gauss', a='lrelu',
                                 uncentered=False, noisy=False, arg_str=None):
     """
     Create a dataset if it doesn't exist.
@@ -595,17 +590,23 @@ def create_if_not_exist_dataset(root='data/', nps=1000, ns=40, dl=2, dd=4, nl=3,
         else:
             noisy = True
 
-    path_to_dataset = root + 'tcl_' + '_'.join(
-        [str(nps), str(ns), str(dl), str(dd), str(nl), str(s), p, a])
+    if dl != dd or dl < 2:
+        raise ValueError('The existing orthogonal generator requires dd == dl >= 2')
+    if a not in ('lrelu', 'sigmoid') or p != 'gauss' or noisy:
+        raise ValueError('Supported causal preset: gauss, lrelu/sigmoid, noisy=f')
+    if min(nps, ns) <= 0 or nl < 2:
+        raise ValueError('Require positive nps/ns and nl >= 2')
+    path_to_dataset = os.path.join(root, 'tcl_' + '_'.join(
+        [str(nps), str(ns), str(dl), str(dd), str(nl), str(s), p, a]))
     if uncentered:
         path_to_dataset += '_u'
     if noisy:
         path_to_dataset += '_n'
-    path_to_dataset += '.npz'
+    path_to_dataset += '_dg2.npz'
 
     if not os.path.exists(path_to_dataset) or s is None:
         kwargs = {"n_per_seg": nps, "n_seg": ns, "d_sources": dl, "d_data": dd, "n_layers": nl, "prior": p,
-                  "activation": a, "seed": s, "batch_size": 0, "uncentered": uncentered, "noisy": noisy}
+                  "activation": a, "seed": s, "batch_size": 0, "uncentered": uncentered, "noisy": noisy, "relation": "linear_Gaussian", "gdegree": 2, "gtype": "ER"}
         save_data(path_to_dataset, **kwargs)
     return path_to_dataset
 
@@ -641,13 +642,13 @@ if __name__ == '__main__':
                         help='Generate uncentered data - default False')
     parser.add_argument('-n', '--noisy', action='store_true', default=False,
                         help='Generate noisy data - default False')
+    parser.add_argument('--output-dir', default='data', help='local data directory')
     args = parser.parse_args()
     if args.dd is None:
         args.dd = 1 * args.dl
 
-    root = '/data/Yuhang/dagVAE-master/data/'
-    if not os.path.exists(root):
-        os.mkdir(root)
+    root = args.output_dir.rstrip('/') + '/'
+    os.makedirs(root, exist_ok=True)
     path_to_dataset = root + 'tcl_' + '_'.join(
         [str(args.nps), str(args.ns), str(args.dl), str(args.dd), str(args.nl), str(args.s), args.p, args.a])
     if args.uncentered:
